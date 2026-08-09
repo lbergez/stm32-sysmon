@@ -18,21 +18,19 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct {
-  volatile uint32_t MODER, OTYPER, OSPEEDER, PUPDR, IDR, ODR, BSRR, LCKR, AFRL, AFRH;
+  volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR, BSRR, LCKR, AFRL, AFRH;
 } gpio;
-#define GPIO(bank) ((gpio *) (0x40020000 + (0x400 * (bank))))
 
 enum {GPIO_INPUT_MODE, GPIO_OUTPUT_MODE, GPIO_AF_MODE, GPIO_ANALOG_MODE};
 
@@ -48,9 +46,6 @@ typedef struct {
 typedef struct {
 	volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR;
 } usartt;
-#define USART2 ((usartt *) (0x40004400))
-
-#define MY_RCC ((rcc *) 0x40023800)
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -61,6 +56,9 @@ typedef struct {
 #define PIN(bank, num) (((bank) - 'A') << 8 | (num))
 #define PINNO(pin) ((pin) & 0xFF)
 #define PINBANK(pin) ((pin) >> 8)
+#define GPIO(bank) ((gpio *) (0x40020000 + (0x400 * (bank))))
+#define USART2 ((usartt *) (0x40004400))
+#define MY_RCC ((rcc *) 0x40023800)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -86,9 +84,35 @@ static inline void gpio_set_mode_x(uint16_t pin, uint8_t mode) {
   g->MODER |= (mode & 3U) << (n * 2);
 }
 
+
+
 static inline void gpio_write(uint16_t pin, bool val) {
   gpio *g = GPIO(PINBANK(pin));
   g->BSRR |= (1U << PINNO(pin)) << (val ? 0 : 16);
+}
+
+static inline bool gpio_read(uint16_t pin) {
+  gpio *g = GPIO(PINBANK(pin));
+  return g->IDR & (1U << PINNO(pin));
+}
+
+enum {LOW_SPEED, MEDIUM_SPEED, FAST_SPEED, HIGH_SPEED};
+
+
+// (mode & 3U) is used to make sure that whatever mode is passed into the function is only two bits wide
+// saving us from potential memory leakage with numbers larger than two bits long
+static inline void gpio_speed(uint16_t pin, uint8_t mode) {
+	gpio *g = GPIO(PINBANK(pin));
+	g->OSPEEDR &= ~(3U << (PINNO(pin) * 2));
+	g->OSPEEDR |= ((mode & 3U) << PINNO(pin) * 2);
+}
+
+enum {NONE, PULLUP, PULLDOWN, RESERVED};
+
+static inline void gpio_set_pull(uint16_t pin, uint8_t mode) {
+	gpio *g = GPIO(PINBANK(pin));
+	g->PUPDR &= ~(3U << (PINNO(pin) * 2));
+	g->PUPDR |= ((mode & 3U) << (PINNO(pin) * 2));
 }
 
 static inline void spin(volatile uint32_t count) {
@@ -105,10 +129,73 @@ static inline void spin(volatile uint32_t count) {
   * @brief  The application entry point.
   * @retval int
   */
-void uart_setup(void) {
-	  MY_RCC->APB1ENR |= (1U << 17);
-	  MY_RCC->AHB1ENR |= BIT(0);
-  }
+void gpio_set_af(uint16_t pin, uint8_t af_num) {
+	gpio *gpio_port = GPIO(PINBANK(pin));
+	gpio_set_mode_x(pin, GPIO_AF_MODE);
+	if (PINNO(pin) < 8) {
+		gpio_port->AFRL &= ~(0xFU << (PINNO(pin) * 4));
+		gpio_port->AFRL |= ((af_num) << (PINNO(pin) * 4));
+	} else {
+		gpio_port->AFRH &= ~(0xFU << ((PINNO(pin) - 8) * 4));
+		gpio_port->AFRH |= ((af_num) << ((PINNO(pin) - 8)) * 4);
+	}
+}
+
+
+
+
+void uart_setup(uint16_t baud) { // come up with func for baud to get rid of baud pass in setup, not bad actually oculd hardcode baud val
+	gpio *gpioa = GPIO(0);
+
+	// set clock for gpio and usart
+	MY_RCC->APB1ENR |= (1U << 17);
+	MY_RCC->AHB1ENR |= BIT(0);
+	// gpio AF config
+	uint16_t tx_pin = PIN('A', 2);
+	uint16_t rx_pin = PIN('A', 3);
+	gpio_set_mode_x(tx_pin, GPIO_AF_MODE);
+	gpio_set_mode_x(rx_pin, GPIO_AF_MODE);
+	// set AF pins
+	gpioa->AFRL &= ~((0xFU << 8) | (0xFU << 12));
+	gpioa->AFRL |= (7U << 8) | (7U << 12);
+	// set high speed
+	gpioa->OSPEEDR |= (3U << 4) | (3U << 6);
+	//BRR calc
+	USART2->BRR = 42000000 / baud; // 42MHz, 115200 baud
+	// enable UE,TE,RE
+	USART2->CR1 |= (1U << 2) | (1U << 3) | (1U << 13);
+}
+
+void uart_write_byte (uint8_t byte) {
+	while ((USART2->SR & (1 << 7)) == 0);
+	USART2->DR = byte;
+}
+
+// in C it's always good to pass both the string and the string length to stop
+// potential errors with no null character being present
+void uart_write_string (char* string) {
+	int stringlength = strlen(string);
+	for (int i = 0; string[i] != '\0' && i < stringlength; i++) {
+		uart_write_byte(string[i]);
+	}
+}
+
+bool uart_available () {
+	if ((USART2->SR & (1 << 5)) != 0) { // try to define all the bits for the sr registers for like 1 shifted by 5, can be changed to a define -> makes code more readable
+		return true;
+	} else {
+		return false;
+	}
+}
+
+uint8_t uart_read_byte(void) {
+	while (uart_available() == false);
+	return USART2->DR;
+}
+
+
+
+
 
 int main(void)
 {
